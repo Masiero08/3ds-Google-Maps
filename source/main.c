@@ -18,6 +18,7 @@
 #include "detail_runtime.h"
 #include "route_follow.h"
 #include "route_steps.h"
+#include <time.h>
 #include "street_heading.h"
 #include "globe_detail.h"
 #include "pano_detail.h"
@@ -2969,7 +2970,15 @@ static bool wait_for_request(const char *url, const char *label, u8 **buffer, u3
             /* Say why: transport error (TLS, DNS, timeout) or the HTTP status
              * the service answered with (403 blocked, 429 rate limited...). */
             char why[96];
-            if (request.info.curl_code)
+            if (request.info.curl_code && request.info.detail[0]) {
+                /* TLS failures are often a wrong console clock, so show the
+                 * console date next to the library's error code. */
+                time_t now = time(NULL);
+                struct tm *tm = localtime(&now);
+                snprintf(why, sizeof(why), "%04d-%02d-%02d %.80s",
+                         tm ? tm->tm_year + 1900 : 0, tm ? tm->tm_mon + 1 : 0,
+                         tm ? tm->tm_mday : 0, request.info.detail);
+            } else if (request.info.curl_code)
                 snprintf(why, sizeof(why), "Net %d: %s", request.info.curl_code,
                          network_error_text(request.info.curl_code));
             else if (request.info.http_status != 200)

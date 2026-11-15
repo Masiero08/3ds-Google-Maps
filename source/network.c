@@ -455,8 +455,18 @@ bool network_request_ex(void *handle, const char *url, size_t limit, atomic_bool
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, cancel ? 0L : 1L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transfer_progress);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel);
+    char errbuf[CURL_ERROR_SIZE] = {0};
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
     CURLcode code = curl_easy_perform(curl);
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, NULL);
     info->curl_code = code;
+    if (code != CURLE_OK) {
+        /* Keep the TLS library's code, e.g. "(-0x2700) X509 - Certificate
+         * verification failed", without curl's fixed prefix. */
+        const char *text = strstr(errbuf, "mbedTLS: ");
+        snprintf(info->detail, sizeof(info->detail), "%s", text ? text + 9 : errbuf);
+        log_write("[REQ] curl %d: %s\n", (int)code, errbuf);
+    }
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &info->http_status);
     if (code != CURLE_OK || info->http_status != 200 || !data.size) {
         free(data.data);

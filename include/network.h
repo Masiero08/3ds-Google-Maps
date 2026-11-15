@@ -43,6 +43,7 @@ typedef struct {
     long http_status;
     unsigned retry_after_ms;
     int curl_code;
+    char detail[128]; /* transport library's own error text, if any */
 } NetworkRequestInfo;
 
 bool network_request(void *handle, const char *url, size_t limit, atomic_bool *cancel,
