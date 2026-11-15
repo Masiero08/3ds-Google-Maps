@@ -771,6 +771,22 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        /* Open on the user's position like a phone map: the first fresh fix
+         * after the GPS source starts (or comes back) centres the map at
+         * street zoom and turns follow on. Panning by hand turns it off. */
+        {
+            static bool had_fix = false;
+            GpsFix first;
+            bool has_fix = gps_is_connected() && gps_get_fix(&first) && first.age_ms < 10000;
+            if (has_fix && !had_fix) {
+                map_state.gps_tracking = true;
+                set_camera_target(first.lat, first.lon,
+                                  g_target_zoom < 16 ? 16 : g_target_zoom, true);
+                set_status_message("GPS: seguindo sua posicao");
+            }
+            if (has_fix || !gps_is_connected()) had_fix = has_fix;
+        }
+
         /* The phone may send many nearly identical fixes while stationary.
          * Update the target only when motion exceeds accuracy/zoom jitter.
          * This avoids churning the visible tile queue during GPS follow. */
