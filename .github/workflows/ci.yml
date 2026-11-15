@@ -40,7 +40,9 @@ jobs:
       - name: Fresh devkitARM build
         run: |
           docker run --rm -v "$PWD:/src" -v "$RUNNER_TEMP/maps-tools:/tools:ro" -w /src devkitpro/devkitarm:latest bash -ec '
-            dkp-pacman -Syu --noconfirm --needed 3ds-dev 3ds-curl 3ds-mbedtls 3ds-libpng 3ds-jansson
+            # The image already ships these packages; the package server sometimes
+            # refuses CI runners (HTTP 403), so an update failure is not fatal.
+            dkp-pacman -Syu --noconfirm --needed 3ds-dev 3ds-curl 3ds-mbedtls 3ds-libpng 3ds-jansson || echo "Package update unavailable; using the packages in the image"
             make clean
             make -j2
           '
