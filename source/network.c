@@ -472,6 +472,10 @@ bool network_request(void *handle, const char *url, size_t limit, atomic_bool *c
     return network_request_ex(handle, url, limit, cancel, buffer, size, NULL);
 }
 
+const char *network_error_text(int curl_code) {
+    return curl_easy_strerror((CURLcode)curl_code);
+}
+
 bool network_region_endpoint(TileSource source, char *endpoint, size_t size) {
     const char *path = source == TILE_SOURCE_SATELLITE ?
         "sdmc:/3ds_google_maps/offline-sat.cfg" : "sdmc:/3ds_google_maps/offline-street.cfg";

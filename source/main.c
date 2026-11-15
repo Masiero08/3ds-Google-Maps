@@ -172,6 +172,7 @@ static char g_last_place_name[96] = {0};
 static u64 g_last_place_ms = 0;
 static char g_status_message[96] = {0};
 static u64 g_status_message_ms = 0;
+static u64 g_status_message_hold_ms = 2200;
 static bool g_debug_overlay = false;
 static bool g_show_coverage;
 static const char *g_request_label;
@@ -363,6 +364,7 @@ static void set_status_message(const char* message) {
     strncpy(g_status_message, message, sizeof(g_status_message) - 1);
     g_status_message[sizeof(g_status_message) - 1] = 0;
     g_status_message_ms = osGetTime();
+    g_status_message_hold_ms = 2200;
 }
 
 static int circle_pad_axis_to_pan(int axis) {
@@ -2705,8 +2707,8 @@ static void render_bottom_panel(void) {
             snprintf(line, sizeof(line), "SD %u  Net %u  Decode %u  GPU %u ms",
                      timing.sd_ms, timing.network_ms, timing.decode_ms, timing.upload_ms);
         else snprintf(line, sizeof(line), "Waiting for a tile timing sample");
-    } else if (g_status_message[0] && (now_ms - g_status_message_ms) < 2200) {
-        snprintf(line, sizeof(line), "Status: %.32s", g_status_message);
+    } else if (g_status_message[0] && (now_ms - g_status_message_ms) < g_status_message_hold_ms) {
+        snprintf(line, sizeof(line), "%.44s", g_status_message);
     } else if (g_route_active && g_route_follow.matched) {
         if(g_route_follow.off_route)
             snprintf(line,sizeof(line),g_nav_lang==ROUTE_LANG_PT_BR?
@@ -2882,13 +2884,15 @@ typedef struct {
     bool ok;
     u8 *bytes;
     u32 size;
+    NetworkRequestInfo info;
 } MapRequest;
 
 static void request_worker(void *arg) {
     MapRequest *request = arg;
     void *curl = network_alloc_tile_curl();
-    request->ok = network_request(curl, request->url, 1024 * 1024,
-                                  &request->cancel, &request->bytes, &request->size);
+    request->ok = network_request_ex(curl, request->url, 1024 * 1024,
+                                     &request->cancel, &request->bytes, &request->size,
+                                     &request->info);
     network_free_tile_curl(curl);
     atomic_store(&request->done, true);
 }
@@ -2944,7 +2948,21 @@ static bool wait_for_request(const char *url, const char *label, u8 **buffer, u3
     threadFree(thread);
     if (atomic_load(&request.cancel) || !request.ok) {
         free(request.bytes);
-        set_status_message(atomic_load(&request.cancel) ? "Request cancelled" : "Network request failed");
+        if (atomic_load(&request.cancel)) set_status_message("Request cancelled");
+        else {
+            /* Say why: transport error (TLS, DNS, timeout) or the HTTP status
+             * the service answered with (403 blocked, 429 rate limited...). */
+            char why[96];
+            if (request.info.curl_code)
+                snprintf(why, sizeof(why), "Net %d: %s", request.info.curl_code,
+                         network_error_text(request.info.curl_code));
+            else if (request.info.http_status != 200)
+                snprintf(why, sizeof(why), "Server answered HTTP %ld", (long)request.info.http_status);
+            else snprintf(why, sizeof(why), "Server sent an empty answer");
+            log_write("[REQ] failed: %s\n", why);
+            set_status_message(why);
+            g_status_message_hold_ms = 9000; /* keep the reason readable */
+        }
         return false;
     }
     *buffer = request.bytes;
