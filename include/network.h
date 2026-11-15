@@ -43,12 +43,15 @@ typedef struct {
     long http_status;
     unsigned retry_after_ms;
     int curl_code;
+    char detail[128]; /* transport library's own error text, if any */
 } NetworkRequestInfo;
 
 bool network_request(void *handle, const char *url, size_t limit, atomic_bool *cancel,
                      u8 **buffer, u32 *size);
 bool network_request_ex(void *handle, const char *url, size_t limit, atomic_bool *cancel,
                         u8 **buffer, u32 *size, NetworkRequestInfo *info);
+/* Short description of a failed request's transport error code. */
+const char *network_error_text(int curl_code);
 bool network_region_endpoint(TileSource source, char *endpoint, size_t size);
 bool network_region_url(const char *endpoint, int x, int y, int z, char *url, size_t size);
 

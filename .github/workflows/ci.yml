@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y libjansson-dev python3-opencv python3-numpy
+      - run: sudo apt-get update && sudo apt-get install -y libjansson-dev libcurl4-openssl-dev python3-opencv python3-numpy
       - name: Full host regression gate with ASan and UBSan
         env:
           ASAN_OPTIONS: detect_leaks=1
@@ -40,10 +40,24 @@ jobs:
       - name: Fresh devkitARM build
         run: |
           docker run --rm -v "$PWD:/src" -v "$RUNNER_TEMP/maps-tools:/tools:ro" -w /src devkitpro/devkitarm:latest bash -ec '
-            dkp-pacman -Syu --noconfirm --needed 3ds-dev 3ds-curl 3ds-mbedtls 3ds-libpng 3ds-jansson
+            # The image already ships these packages; the package server sometimes
+            # refuses CI runners (HTTP 403), so an update failure is not fatal.
+            dkp-pacman -Syu --noconfirm --needed 3ds-dev 3ds-curl 3ds-mbedtls 3ds-libpng 3ds-jansson || echo "Package update unavailable; using the packages in the image"
             make clean
-            make -j2 cia BANNERTOOL=/tools/bannertool MAKEROM=/tools/makerom
+            make -j2
           '
+          # The prebuilt packaging tools need a newer glibc than the devkitARM
+          # image ships, so package the CIA on the runner itself. These are
+          # the same commands as the Makefile's cia target.
+          sudo chown -R "$(id -u):$(id -g)" .
+          T="$RUNNER_TEMP/maps-tools"
+          title="$(sed -n 's/^APP_TITLE[[:space:]]*:=[[:space:]]*//p' Makefile)"
+          description="$(sed -n 's/^APP_DESCRIPTION[[:space:]]*:=[[:space:]]*//p' Makefile)"
+          "$T/makerom" -help | grep -q '^CTR MAKEROM v0\.18\.4 '
+          "$T/bannertool" makesmdh -s "$title" -l "$description" -p "Oldhimaster1" -i icon.png -r regionfree -f visible -o build/cia-icon.bin
+          "$T/bannertool" makebanner -i banner.png -a banner.wav -o build/cia-banner.bin
+          "$T/makerom" -f ncch -target t -rsf tools/cia.rsf -elf 3ds_google_maps.elf -icon build/cia-icon.bin -banner build/cia-banner.bin -o build/3ds_google_maps.cxi
+          "$T/makerom" -f cia -target t -content build/3ds_google_maps.cxi:0:0 -major 2 -minor 2 -micro 0 -o 3ds_google_maps.cia
           mkdir -p dist
           cp 3ds_google_maps.cia 3ds_google_maps.3dsx dist/
           python3 tools/verify_build.py dist

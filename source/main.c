@@ -17,6 +17,8 @@
 #include "input_remap.h"
 #include "detail_runtime.h"
 #include "route_follow.h"
+#include "route_steps.h"
+#include <time.h>
 #include "street_heading.h"
 #include "globe_detail.h"
 #include "pano_detail.h"
@@ -171,6 +173,7 @@ static char g_last_place_name[96] = {0};
 static u64 g_last_place_ms = 0;
 static char g_status_message[96] = {0};
 static u64 g_status_message_ms = 0;
+static u64 g_status_message_hold_ms = 2200;
 static bool g_debug_overlay = false;
 static bool g_show_coverage;
 static const char *g_request_label;
@@ -255,6 +258,11 @@ static unsigned g_route_geometry_count;
 static int g_route_count = 0;
 static bool g_route_active = false;
 static RouteFollow g_route_follow;
+/* Turn-by-turn maneuvers of the active route (OSRM steps). */
+static RouteSteps g_route_steps;
+static RouteSteps g_route_steps_scratch;
+/* Language and units for navigation text: pt-BR uses metres/kilometres. */
+static const RouteLang g_nav_lang = ROUTE_LANG_PT_BR;
 static bool g_route_has_destination;
 static double g_route_destination_lat,g_route_destination_lon;
 static unsigned g_route_last_fix_sequence;
@@ -305,6 +313,7 @@ static void reroute_from_gps(double lat,double lon);
 static bool geocode_pick(const char* query, GeocodeResult* out);
 static bool parse_route_json(const char* json, u32 json_size);
 static void render_route_overlay(double center_lat, double center_lon, int zoom, int screen_width, int screen_height);
+static void render_nav_banner(void);
 static void close_explore(void);
 static void render_explore(void);
 static void update_explore(void);
@@ -356,7 +365,19 @@ static void set_status_message(const char* message) {
     strncpy(g_status_message, message, sizeof(g_status_message) - 1);
     g_status_message[sizeof(g_status_message) - 1] = 0;
     g_status_message_ms = osGetTime();
+    g_status_message_hold_ms = 2200;
 }
+
+/* Turning Track on jumps straight to the current position at street zoom,
+ * instead of waiting for the next movement at whatever zoom was showing. */
+static void set_camera_target(double lat, double lon, int zoom, bool snap_now);
+static void gps_track_jump_to_fix(void) {
+    GpsFix fix;
+    if (!map_state.gps_tracking) return;
+    if (!gps_get_fix(&fix)) { set_status_message("Track ON: aguardando posicao do GPS"); return; }
+    set_camera_target(fix.lat, fix.lon, g_target_zoom < 16 ? 16 : g_target_zoom, true);
+}
+
 
 static int circle_pad_axis_to_pan(int axis) {
     const int deadzone = (int)g_earth_options.dead_zone;
@@ -762,6 +783,22 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        /* Open on the user's position like a phone map: the first fresh fix
+         * after the GPS source starts (or comes back) centres the map at
+         * street zoom and turns follow on. Panning by hand turns it off. */
+        {
+            static bool had_fix = false;
+            GpsFix first;
+            bool has_fix = gps_is_connected() && gps_get_fix(&first) && first.age_ms < 10000;
+            if (has_fix && !had_fix) {
+                map_state.gps_tracking = true;
+                set_camera_target(first.lat, first.lon,
+                                  g_target_zoom < 16 ? 16 : g_target_zoom, true);
+                set_status_message("GPS: seguindo sua posicao");
+            }
+            if (has_fix || !gps_is_connected()) had_fix = has_fix;
+        }
+
         /* The phone may send many nearly identical fixes while stationary.
          * Update the target only when motion exceeds accuracy/zoom jitter.
          * This avoids churning the visible tile queue during GPS follow. */
@@ -776,7 +813,7 @@ int main(int argc, char* argv[]) {
 
         /* Consume each accepted GPS update once, not every rendered frame.
          * Three distinct off-route fixes are required before automatic retry.
-         * Routing does NOT add maneuver/turn-by-turn instructions. */
+         * The next maneuver is derived from progress in render_nav_banner(). */
         if(g_route_active && g_route_follow.path && g_route_has_destination){
             GpsFix fix;
             if(gps_get_fix(&fix) && fix.age_ms<5000 &&
@@ -988,6 +1025,7 @@ void update_input(void) {
         if (gps_is_connected()) {
             map_state.gps_tracking = !map_state.gps_tracking;
             set_status_message(map_state.gps_tracking ? "GPS tracking ON" : "GPS tracking OFF");
+            gps_track_jump_to_fix();
         } else {
             set_status_message("Connect GPS first");
         }
@@ -1138,6 +1176,7 @@ static bool handle_touch_button_action(TouchAction action) {
             if (gps_is_connected()) {
                 map_state.gps_tracking = !map_state.gps_tracking;
                 set_status_message(map_state.gps_tracking ? "GPS tracking ON" : "GPS tracking OFF");
+                gps_track_jump_to_fix();
             } else {
                 set_status_message("Connect GPS first");
             }
@@ -1808,6 +1847,7 @@ void render_map(void) {
 
         render_route_overlay(map_state.lat, map_state.lon, map_state.zoom, SCREEN_WIDTH_TOP, SCREEN_HEIGHT_TOP);
         draw_gps_fix();
+        render_nav_banner();
 
         if (g_night_mode) {
             C2D_DrawRectSolid(0.0f, 0.0f, 0.95f, (float)SCREEN_WIDTH_TOP, (float)SCREEN_HEIGHT_TOP,
@@ -2697,11 +2737,20 @@ static void render_bottom_panel(void) {
             snprintf(line, sizeof(line), "SD %u  Net %u  Decode %u  GPU %u ms",
                      timing.sd_ms, timing.network_ms, timing.decode_ms, timing.upload_ms);
         else snprintf(line, sizeof(line), "Waiting for a tile timing sample");
-    } else if (g_status_message[0] && (now_ms - g_status_message_ms) < 2200) {
-        snprintf(line, sizeof(line), "Status: %.32s", g_status_message);
+    } else if (g_status_message[0] && (now_ms - g_status_message_ms) < g_status_message_hold_ms) {
+        snprintf(line, sizeof(line), "%.44s", g_status_message);
     } else if (g_route_active && g_route_follow.matched) {
         if(g_route_follow.off_route)
-            snprintf(line,sizeof(line),"Off route: checking GPS position");
+            snprintf(line,sizeof(line),g_nav_lang==ROUTE_LANG_PT_BR?
+                     "Fora da rota: verificando GPS":"Off route: checking GPS position");
+        else if(g_nav_lang==ROUTE_LANG_PT_BR){
+            char left[24];
+            route_format_distance(g_route_follow.remaining_m,g_nav_lang,left,sizeof(left));
+            if(g_route_follow.duration_s>0)
+                snprintf(line,sizeof(line),"Faltam %s, chegada em %.0f min",
+                         left,g_route_follow.eta_s/60);
+            else snprintf(line,sizeof(line),"Faltam %s",left);
+        }
         else if(g_route_follow.duration_s>0)
             snprintf(line,sizeof(line),"Route %.1f mi left, ETA %.0f min",
                      g_route_follow.remaining_m/1609.344,
@@ -2865,13 +2914,15 @@ typedef struct {
     bool ok;
     u8 *bytes;
     u32 size;
+    NetworkRequestInfo info;
 } MapRequest;
 
 static void request_worker(void *arg) {
     MapRequest *request = arg;
     void *curl = network_alloc_tile_curl();
-    request->ok = network_request(curl, request->url, 1024 * 1024,
-                                  &request->cancel, &request->bytes, &request->size);
+    request->ok = network_request_ex(curl, request->url, 1024 * 1024,
+                                     &request->cancel, &request->bytes, &request->size,
+                                     &request->info);
     network_free_tile_curl(curl);
     atomic_store(&request->done, true);
 }
@@ -2927,7 +2978,29 @@ static bool wait_for_request(const char *url, const char *label, u8 **buffer, u3
     threadFree(thread);
     if (atomic_load(&request.cancel) || !request.ok) {
         free(request.bytes);
-        set_status_message(atomic_load(&request.cancel) ? "Request cancelled" : "Network request failed");
+        if (atomic_load(&request.cancel)) set_status_message("Request cancelled");
+        else {
+            /* Say why: transport error (TLS, DNS, timeout) or the HTTP status
+             * the service answered with (403 blocked, 429 rate limited...). */
+            char why[96];
+            if (request.info.curl_code && request.info.detail[0]) {
+                /* TLS failures are often a wrong console clock, so show the
+                 * console date next to the library's error code. */
+                time_t now = time(NULL);
+                struct tm *tm = localtime(&now);
+                snprintf(why, sizeof(why), "%04d-%02d-%02d %.80s",
+                         tm ? tm->tm_year + 1900 : 0, tm ? tm->tm_mon + 1 : 0,
+                         tm ? tm->tm_mday : 0, request.info.detail);
+            } else if (request.info.curl_code)
+                snprintf(why, sizeof(why), "Net %d: %s", request.info.curl_code,
+                         network_error_text(request.info.curl_code));
+            else if (request.info.http_status != 200)
+                snprintf(why, sizeof(why), "Server answered HTTP %ld", (long)request.info.http_status);
+            else snprintf(why, sizeof(why), "Server sent an empty answer");
+            log_write("[REQ] failed: %s\n", why);
+            set_status_message(why);
+            g_status_message_hold_ms = 9000; /* keep the reason readable */
+        }
         return false;
     }
     *buffer = request.bytes;
@@ -3134,11 +3207,42 @@ static bool parse_route_json(const char *json, u32 size) {
                            distance,duration)){
         free(points);json_decref(root);return false;
     }
+    /* Turn-by-turn: collect every leg's maneuvers (requires steps=true).
+     * The proxy "poly" format has no steps, so the list stays empty. */
+    route_steps_clear(&g_route_steps_scratch);
+    json_t *legs=json_object_get(route,"legs");
+    for(size_t l=0;!poly&&l<json_array_size(legs);l++){
+        json_t *steps=json_object_get(json_array_get(legs,l),"steps");
+        for(size_t k=0;k<json_array_size(steps);k++){
+            json_t *step=json_array_get(steps,k);
+            json_t *man=json_object_get(step,"maneuver");
+            json_t *loc=json_object_get(man,"location");
+            double mlat,mlon;
+            if(!json_coord(json_array_get(loc,0),180,&mlon)||
+               !json_coord(json_array_get(loc,1),90,&mlat))continue;
+            RouteStepType type=route_step_type_from_osrm(
+                json_string_value(json_object_get(man,"type")));
+            /* Only the final leg's arrival is the destination. */
+            if(type==ROUTE_STEP_ARRIVE&&l+1<json_array_size(legs))continue;
+            if(type==ROUTE_STEP_DEPART&&l>0)continue;
+            json_t *ex=json_object_get(man,"exit");
+            const char *name=json_string_value(json_object_get(step,"name"));
+            const char *ref=json_string_value(json_object_get(step,"ref"));
+            if((!name||!*name)&&ref)name=ref;
+            (void)route_steps_add(&g_route_steps_scratch,mlat,mlon,type,
+                route_step_modifier_from_osrm(
+                    json_string_value(json_object_get(man,"modifier"))),
+                json_is_integer(ex)?(int)json_integer_value(ex):0,name);
+        }
+    }
+    if(g_route_steps_scratch.count)
+        (void)route_steps_attach(&g_route_steps_scratch,&fresh);
     g_route_next_dist_m = (int)fmin(2147483647, fmax(0, distance));
     snprintf(g_route_next_text, sizeof(g_route_next_text), "%s", next && *next ? next : "Route");
     route_follow_reset(&g_route_follow);
     free(g_route_geometry);
     g_route_follow=fresh;
+    g_route_steps=g_route_steps_scratch;
     g_route_last_fix_sequence=0;
     g_route_geometry = points;
     g_route_geometry_count = count;
@@ -3220,13 +3324,48 @@ static void reroute_from_gps(double lat,double lon) {
                  g_route_destination_lat,g_route_destination_lon);
     else
         snprintf(url,sizeof(url),"https://router.project-osrm.org/route/v1/driving/"
-                 "%.6f,%.6f;%.6f,%.6f?overview=full&geometries=geojson&steps=false",
+                 "%.6f,%.6f;%.6f,%.6f?overview=full&geometries=geojson&steps=true",
                  lon,lat,g_route_destination_lon,g_route_destination_lat);
     u8 *buf=NULL;u32 length=0;
     if(!wait_for_request(url,"Rerouting", &buf,&length))return;
     bool ok=parse_route_json((const char*)buf,length);
     free(buf);
     set_status_message(ok?"Route updated from GPS":"Could not recalculate route");
+}
+
+/* Turn-by-turn banner across the top of the upper screen: big distance to
+ * the next maneuver plus the full instruction, readable from a car mount. */
+static void render_nav_banner(void) {
+    if (!g_route_active || !g_route_follow.matched || g_route_follow.off_route) return;
+    double dist = 0;
+    const RouteStep *next = route_steps_next(&g_route_steps, &g_route_follow, &dist);
+    if (!next) return;
+    char instruction[160], distance[24];
+    if (!route_step_format(next, -1, g_nav_lang, instruction, sizeof(instruction)))
+        instruction[sizeof(instruction) - 1] = '\0';
+    route_format_distance(dist, g_nav_lang, distance, sizeof(distance));
+    /* Highlight the banner when the maneuver is close. */
+    bool soon = dist < 150;
+    u32 bg = soon ? C2D_Color32f(0.05f, 0.45f, 0.20f, 0.92f)
+                  : C2D_Color32f(0.06f, 0.10f, 0.16f, 0.88f);
+    u32 white = C2D_Color32f(1.0f, 1.0f, 1.0f, 1.0f);
+    C2D_TextBufClear(g_ui_text_buf);
+    C2D_DrawRectSolid(0.0f, 0.0f, 0.96f, (float)SCREEN_WIDTH_TOP, 46.0f, bg);
+    draw_ui_text(8.0f, 4.0f, 0.80f, 0.80f, white, 0,
+                 next->type == ROUTE_STEP_ARRIVE && dist < 30 ? "" : distance);
+    /* Two lines of up to ~34 characters, split at a space. */
+    char second[160] = {0};
+    if (strlen(instruction) > 34) {
+        char *cut = NULL;
+        for (char *p = instruction; *p && p - instruction <= 34; p++)
+            if (*p == ' ') cut = p;
+        if (cut) { snprintf(second, sizeof(second), "%s", cut + 1); *cut = '\0'; }
+    }
+    draw_ui_text(112.0f, second[0] ? 4.0f : 13.0f, 0.46f, 0.46f, white, 0, instruction);
+    if (second[0]) draw_ui_text(112.0f, 23.0f, 0.46f, 0.46f, white, 0, second);
+    if (next->type == ROUTE_STEP_ARRIVE && dist < 30)
+        draw_ui_text(8.0f, 12.0f, 0.60f, 0.60f, white, 0,
+                     g_nav_lang == ROUTE_LANG_PT_BR ? "Você chegou ao destino" : "You have arrived");
 }
 
 static void render_route_overlay(double center_lat, double center_lon, int zoom, int screen_width, int screen_height) {
