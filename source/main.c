@@ -368,6 +368,17 @@ static void set_status_message(const char* message) {
     g_status_message_hold_ms = 2200;
 }
 
+/* Turning Track on jumps straight to the current position at street zoom,
+ * instead of waiting for the next movement at whatever zoom was showing. */
+static void set_camera_target(double lat, double lon, int zoom, bool snap_now);
+static void gps_track_jump_to_fix(void) {
+    GpsFix fix;
+    if (!map_state.gps_tracking) return;
+    if (!gps_get_fix(&fix)) { set_status_message("Track ON: aguardando posicao do GPS"); return; }
+    set_camera_target(fix.lat, fix.lon, g_target_zoom < 16 ? 16 : g_target_zoom, true);
+}
+
+
 static int circle_pad_axis_to_pan(int axis) {
     const int deadzone = (int)g_earth_options.dead_zone;
     const int max_speed = 16;
@@ -1014,6 +1025,7 @@ void update_input(void) {
         if (gps_is_connected()) {
             map_state.gps_tracking = !map_state.gps_tracking;
             set_status_message(map_state.gps_tracking ? "GPS tracking ON" : "GPS tracking OFF");
+            gps_track_jump_to_fix();
         } else {
             set_status_message("Connect GPS first");
         }
@@ -1164,6 +1176,7 @@ static bool handle_touch_button_action(TouchAction action) {
             if (gps_is_connected()) {
                 map_state.gps_tracking = !map_state.gps_tracking;
                 set_status_message(map_state.gps_tracking ? "GPS tracking ON" : "GPS tracking OFF");
+                gps_track_jump_to_fix();
             } else {
                 set_status_message("Connect GPS first");
             }
